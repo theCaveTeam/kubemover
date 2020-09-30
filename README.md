@@ -12,16 +12,16 @@ tsc && node /dist/index.js  cluster123-d cluster456 --ns sg-test
 
 Run as a docker container
 
-``` docker run -v {path to kubeconfig file}:/cfg/config gr4b4z/kubemover  -s {source context} -d {destination context} --ns {namespace} ``` 
+``` docker run -v {path to kubeconfig file}:/cfg/config thecaveteam/kubemover  -s {source context} -d {destination context} --ns {namespace} ``` 
 
 Examples:
 
 ``` 
-docker run -v ~/.kube/config:/cfg/config gr4b4z/kubemover  -s cluster123 -d cluster456 --ns mynamespace 
+docker run -v ~/.kube/config:/cfg/config thecaveteam/kubemover  -s cluster123 -d cluster456 --ns mynamespace 
 
-docker run -v ~/.kube/config:/cfg/config gr4b4z/kubemover  -s cluster123 -d cluster456 --ns mynamespace --ns mynamespace2
+docker run -v ~/.kube/config:/cfg/config thecaveteam/kubemover  -s cluster123 -d cluster456 --ns mynamespace --ns mynamespace2
 
-docker run -v ~/.kube/config:/cfg/config gr4b4z/kubemover  -s cluster123 -d cluster456 --ns mynames*
+docker run -v ~/.kube/config:/cfg/config thecaveteam/kubemover  -s cluster123 -d cluster456 --ns mynames*
 
 ``` 
 
@@ -36,7 +36,7 @@ kubectl create ns test1234 --context kind-source-cluster --kubeconfig config
 kubectl run nginx --image=nginx --replicas=1 -n test1234 --context kind-source-cluster --kubeconfig config
 
 
-docker run --network=host -v $(pwd)/config:/cfg/config gr4b4z/kubemover  -s kind-source-cluster -d kind-target-cluster --ns test1234
+docker run --network=host -v $(pwd)/config:/cfg/config thecaveteam/kubemover  -s kind-source-cluster -d kind-target-cluster --ns test1234
 
 kubectl get pods -n test1234 --context kind-target-cluster --kubeconfig config 
 

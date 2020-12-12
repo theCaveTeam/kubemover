@@ -1,6 +1,6 @@
 {
-  "name": "move-workload",
-  "version": "1.0.0",
+  "name": "kubemover",
+  "version": "1.0.1",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -11,7 +11,8 @@
   "dependencies": {
     "@types/minimist": "^1.2.0",
     "minimist": "^1.2.5",
-    "node-fetch": "^2.6.0"
+    "node-fetch": "^2.6.0",
+    "winston": "^3.3.3"
   },
   "devDependencies": {
     "@types/node-fetch": "^2.5.7"

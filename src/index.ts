@@ -1,43 +1,57 @@
 import fetch from 'node-fetch'
 import fs from 'fs'
 import minimist from 'minimist';
+import winston from 'winston';
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(winston.format.timestamp(),winston.format.json()),
+  transports: [
+    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'logs/combined.log' }),
+  ],
+});
+logger.add(new winston.transports.Console({
+    format: winston.format.combine(winston.format.timestamp(), winston.format.cli()),
+  }));
 
 var argv = minimist(process.argv.slice(2));
-console.log(argv)
+logger.info(JSON.stringify(argv))
+
 
 const SOURCE_PROXY = argv["source"] || "http://localhost:8001";
 const TARGET_PROXY = argv["target"] || "http://localhost:8011";
 let ns = argv["ns"] || ["example_ns"]
+let override = argv["override"] === true;
 const NAMESPACES = Array.isArray(ns) ? ns : [ns];
 
-console.log(`Starting migration from ${SOURCE_PROXY} to ${TARGET_PROXY}. Namespaces: ${ns}`);
+logger.info(`Starting migration from ${SOURCE_PROXY} to ${TARGET_PROXY}. Namespaces: ${ns}`);
 
 (async function () {
 
-    console.log("Connecting to source")
+    logger.info("Connecting to source")
     let resourcesToRecreate: any[] = await getAvaiableResourcesOnCluster(SOURCE_PROXY);
-    console.log("Connecting to target")
+    logger.info("Connecting to target")
     let resourcesOnTarget: any[] = await getAvaiableResourcesOnCluster(TARGET_PROXY);
 
     let diff = resourcesToRecreate.filter(e => resourcesOnTarget.every(tr => tr.path + tr.name != e.path + e.name));
     if (diff.length > 0) {
-        console.log("There is no endpoints on target server for the following resources")
+        logger.info("There is no endpoints on target server for the following resources")
         for (const iterator of diff) {
-            console.log(iterator.path + '/' + iterator.name)
+            logger.info(iterator.path + '/' + iterator.name)
         }
     }
     let missingApiPaths = new Set(diff.map(e => e.path));
 
     let namespacesToCopyFrom = await getSourceNamespaces(SOURCE_PROXY);
     if (namespacesToCopyFrom.length == 0) {
-        console.log("No namespaces found that match filter criteria:\n" + namespacesToCopyFrom.join(','))
+        logger.info("No namespaces found that match filter criteria:\n" + namespacesToCopyFrom.join(','))
         process.exit(1);
     }
-    console.log("Resources will be copied from below namespaces:\n" + namespacesToCopyFrom.join(','))
+    logger.info("Resources will be copied from below namespaces:\n" + namespacesToCopyFrom.join(','))
     await createNamespaces(TARGET_PROXY, namespacesToCopyFrom);
 
     for (const namespace of namespacesToCopyFrom) {
-
         //GET SOURCE RESOURCES
         try {
 
@@ -50,7 +64,7 @@ console.log(`Starting migration from ${SOURCE_PROXY} to ${TARGET_PROXY}. Namespa
             //     dumpFile(iterator)
             // }
         } catch (error) {
-            console.error(error);
+            logger.error(error);
         }
 
 
@@ -63,25 +77,58 @@ console.log(`Starting migration from ${SOURCE_PROXY} to ${TARGET_PROXY}. Namespa
 async function createResourcesOnTarget(resources: { prefix: string; apiPath: any; o: any; }[], url: string) {
     sortAccordingToPriority(resources);
     for (const resource of resources) {
+        let resourceLogger = logger.child({kind:resource.o.kind, name:resource.o.name})
         cleanup(resource.o);
 
-        let pathsResponse = await fetch(url + resource.prefix, {
-            method: "POST",
-            body: JSON.stringify(resource.o),
-            headers: { 'Content-Type': 'application/json' },
-        });
+        let pathsResponse = await createResource(url,resource);
+
         if (pathsResponse.status < 300) {
-            console.log("Resource created")
+            resourceLogger.info("Resource created")
         } else if (pathsResponse.status == 409) {
-            console.log("Conflict. Resource exists ")
-            console.error(await pathsResponse.json());
+            resourceLogger.info("Resource conflict. Resource exists ")
+            resourceLogger.debug(JSON.stringify(await pathsResponse.json()));
+            if(override){
+                resourceLogger.info("Overriding.")
+                let response = await deleteResource(url,resource);
+                if(response.status == 200 ||response.status  == 202){
+                    response = await createResource(url,resource);
+                    if(response.status < 203){
+                        resourceLogger.info("Resource recreated")
+                    }else{
+                        resourceLogger.error("Resource was removed, but couldn't be recreated")
+                    }
+                }else{
+                    resourceLogger.error("Resource can't be removed, Try to remove manually")
+
+                }
+
+            }
         }
         else {
-            console.error(pathsResponse.status + pathsResponse.statusText);
-            console.error(await pathsResponse.json());
+            resourceLogger.error("Can not be created")
+            resourceLogger.error(pathsResponse.status + pathsResponse.statusText);
+            resourceLogger.debug(JSON.stringify(await pathsResponse.json()));
         }
     }
 }
+function createResource(url:string, resource: { prefix: string; apiPath: any; o: any; }, ){
+    let pathsResponse = fetch(url + resource.prefix, {
+        method: "POST",
+        body: JSON.stringify(resource.o),
+        headers: { 'Content-Type': 'application/json' },
+    });
+    return pathsResponse
+}
+ 
+function deleteResource(url:string, resource: { prefix: string; apiPath: any; o: any; }, ){
+    let pathsResponse = fetch(url + resource.prefix+"/"+resource.o.name, {
+        method: "DELETE",
+        headers: { 'Content-Type': 'application/json' },
+    });
+    return pathsResponse
+}
+
+
 async function createNamespaces(url: string, namespaces: string[]) {
     let resource = namespaces.map(e => ({
         prefix: "/api/v1/namespaces", apiPath: null, o: {
@@ -132,26 +179,28 @@ async function readResourcesFromSource(resourcesToRecreate: any[], namespace: st
 
     for (const iterator of resourcesToRecreate) {
         let u = iterator.path + "/namespaces/" + namespace + "/" + iterator.name;
-        console.log("Checking " + u)
+        var localLogger = logger.child({namespace: u, name: iterator.name});
+       
+        localLogger.info("Checking " + u)
         let resourceResponse = await fetch(url + u);
         if (resourceResponse.status > 299) {
-            console.log("Failed");
+            localLogger.error("Failed");
             continue;
         }
         let res = await resourceResponse.json();
         if (res.items.length == 0) {
-            console.log("No resources");
+            localLogger.info("No resources");
             continue;
         }
 
-        console.log("Success");
+        localLogger.info("Success");
         for (let i = 0; i < res.items.length; i++) {
             let id = res.items[i].metadata.uid;
 
             if (res.items[i].metadata &&
                 res.items[i].metadata["ownerReferences"] &&
                 res.items[i].metadata["ownerReferences"].length > 0) {
-                console.log("Object " + res.items[i].metadata["name"] + "is owned, skipping creation")
+                    localLogger.info("Object " + res.items[i].metadata["name"] + "is owned, skipping creation")
             } else {
                 resources.push({ prefix: u, apiPath: iterator.path, o: res.items[i] });
             }

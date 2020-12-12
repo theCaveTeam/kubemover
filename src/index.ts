@@ -182,5 +182,16 @@ function cleanup(resource: any) {
     delete resource.metadata.resourceVersion;
     delete resource.metadata.uid;
     delete resource.metadata.creationTimestamp;
+    
+    try {
+        switch(resource.kind){
+            case "Service": 
+            delete resource.spec.clusterIP; // ADD SWITCH to allow cluster IP settings
+            break;
+        } 
+    } catch (error) {
+        
+    }
+
 }
 

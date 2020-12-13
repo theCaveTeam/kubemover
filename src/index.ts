@@ -1,10 +1,18 @@
 import fetch from 'node-fetch'
 import fs from 'fs'
 import minimist from 'minimist';
-import winston from 'winston';
+import winston, {format} from 'winston';
+const {printf} = format;
+
+const myFormat = printf(({ level, message,metadata }) => {
+    let t = metadata.timestamp;
+    delete metadata.timestamp;
+
+    return `${t}  ${level}: ${message} ${JSON.stringify(metadata)}`;
+  });
 
 const logger = winston.createLogger({
-  level: 'info',
+  level: 'debug',
   format: winston.format.combine(winston.format.timestamp(),winston.format.json()),
   transports: [
     new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
@@ -12,7 +20,8 @@ const logger = winston.createLogger({
   ],
 });
 logger.add(new winston.transports.Console({
-    format: winston.format.combine(winston.format.timestamp(), winston.format.cli()),
+    level:"info",
+    format: winston.format.combine(winston.format.timestamp(), winston.format.metadata(), myFormat),
   }));
 
 var argv = minimist(process.argv.slice(2));
@@ -28,27 +37,34 @@ const NAMESPACES = Array.isArray(ns) ? ns : [ns];
 logger.info(`Starting migration from ${SOURCE_PROXY} to ${TARGET_PROXY}. Namespaces: ${ns}`);
 
 (async function () {
+    let sourceLogger = logger.child({source: SOURCE_PROXY});
+    let targetLogger = logger.child({target: TARGET_PROXY});
 
-    logger.info("Connecting to source")
+    sourceLogger.info("Connecting to source")
     let resourcesToRecreate: any[] = await getAvaiableResourcesOnCluster(SOURCE_PROXY);
-    logger.info("Connecting to target")
+    sourceLogger.info(`Connected. Found ${resourcesToRecreate.length} resources` )
+
+    targetLogger.info("Connecting to target")
     let resourcesOnTarget: any[] = await getAvaiableResourcesOnCluster(TARGET_PROXY);
+    targetLogger.info(`Connected. Found ${resourcesOnTarget.length} resources` )
 
     let diff = resourcesToRecreate.filter(e => resourcesOnTarget.every(tr => tr.path + tr.name != e.path + e.name));
     if (diff.length > 0) {
-        logger.info("There is no endpoints on target server for the following resources")
+        targetLogger.info("There is no endpoints on target server for the following resources")
         for (const iterator of diff) {
-            logger.info(iterator.path + '/' + iterator.name)
+            targetLogger.info(iterator.path + '/' + iterator.name)
         }
     }
     let missingApiPaths = new Set(diff.map(e => e.path));
 
-    let namespacesToCopyFrom = await getSourceNamespaces(SOURCE_PROXY);
+    let sourceNamespaces = await getSourceNamespaces(SOURCE_PROXY);
+    let namespacesToCopyFrom = await getCopyFromNamespaces(sourceNamespaces);
     if (namespacesToCopyFrom.length == 0) {
-        logger.info("No namespaces found that match filter criteria:\n" + namespacesToCopyFrom.join(','))
+        sourceLogger.info("No namespaces found that match filter criteria: "+NAMESPACES.join(', '))
+        sourceLogger.info("Found namespaces : "+ sourceNamespaces.join(', '))
         process.exit(1);
     }
-    logger.info("Resources will be copied from below namespaces:\n" + namespacesToCopyFrom.join(','))
+    sourceLogger.info("Resources will be copied from below namespaces:\n" + namespacesToCopyFrom.join(', '))
     await createNamespaces(TARGET_PROXY, namespacesToCopyFrom);
 
     for (const namespace of namespacesToCopyFrom) {
@@ -74,11 +90,11 @@ logger.info(`Starting migration from ${SOURCE_PROXY} to ${TARGET_PROXY}. Namespa
 
 
 })();
-async function createResourcesOnTarget(resources: { prefix: string; apiPath: any; o: any; }[], url: string) {
+async function createResourcesOnTarget(resources: ResourceToMove[], url: string, donotdelete:boolean = false) {
     sortAccordingToPriority(resources);
     for (const resource of resources) {
-        let resourceLogger = logger.child({kind:resource.o.kind, name:resource.o.name})
-        cleanup(resource.o);
+        let resourceLogger = logger.child({name:resource.o.metadata.name, kind: resource.rsName})
+        cleanup(resource);
 
         let pathsResponse = await createResource(url,resource);
 
@@ -87,9 +103,10 @@ async function createResourcesOnTarget(resources: { prefix: string; apiPath: any
         } else if (pathsResponse.status == 409) {
             resourceLogger.info("Resource conflict. Resource exists ")
             resourceLogger.debug(JSON.stringify(await pathsResponse.json()));
-            if(override){
+            if(donotdelete == false && override){
                 resourceLogger.info("Overriding.")
                 let response = await deleteResource(url,resource);
+                await sleep(5*1000);
                 if(response.status == 200 ||response.status  == 202){
                     response = await createResource(url,resource);
                     if(response.status < 203){
@@ -111,7 +128,7 @@ async function createResourcesOnTarget(resources: { prefix: string; apiPath: any
         }
     }
 }
-function createResource(url:string, resource: { prefix: string; apiPath: any; o: any; }, ){
+function createResource(url:string, resource: ResourceToMove, ){
     let pathsResponse = fetch(url + resource.prefix, {
         method: "POST",
         body: JSON.stringify(resource.o),
@@ -120,8 +137,8 @@ function createResource(url:string, resource: { prefix: string; apiPath: any; o:
     return pathsResponse
 }
  
-function deleteResource(url:string, resource: { prefix: string; apiPath: any; o: any; }, ){
-    let pathsResponse = fetch(url + resource.prefix+"/"+resource.o.name, {
+function deleteResource(url:string, resource: ResourceToMove, ){
+    let pathsResponse = fetch(url + resource.prefix+"/"+resource.o.metadata.name+"?gracePeriodSeconds=0", {
         method: "DELETE",
         headers: { 'Content-Type': 'application/json' },
     });
@@ -130,22 +147,29 @@ function deleteResource(url:string, resource: { prefix: string; apiPath: any; o:
 
 
 async function createNamespaces(url: string, namespaces: string[]) {
-    let resource = namespaces.map(e => ({
-        prefix: "/api/v1/namespaces", apiPath: null, o: {
+    let resources = namespaces.map(e => ({
+        prefix: "/api/v1/namespaces", 
+        ns:e,
+        rsName:"namespace",
+        apiPath: null, 
+        o: {
             "apiVersion": "v1",
             "kind": "Namespace",
             "metadata": {
                 "name": e,
             }
         }
-    }))
-    await createResourcesOnTarget(resource, url);
+    } as ResourceToMove))
+    await createResourcesOnTarget(resources, url, true);
 }
 async function getSourceNamespaces(url: string) {
     let pathsResponse = await fetch(url + '/api/v1/namespaces');
     let json = await pathsResponse.json();
     let namespacesOnTheCluster: string[] = json.items.map((f: { metadata: { name: string; }; }) => f.metadata.name);
+    return namespacesOnTheCluster;
+}
 
+async function getCopyFromNamespaces(namespacesOnTheCluster: string[]) {
     let regex = NAMESPACES.map(e => new RegExp(e));
     let namespacesToCopyFrom = namespacesOnTheCluster.filter(ns => regex.find(re => re.test(ns)));
     return namespacesToCopyFrom;
@@ -175,11 +199,11 @@ async function getAvaiableResourcesOnCluster(url: string) {
     return resourcesToRecreate;
 }
 async function readResourcesFromSource(resourcesToRecreate: any[], namespace: string, url: string) {
-    let resources = [];
+    let resources :Array<ResourceToMove> = [];
 
     for (const iterator of resourcesToRecreate) {
         let u = iterator.path + "/namespaces/" + namespace + "/" + iterator.name;
-        var localLogger = logger.child({namespace: u, name: iterator.name});
+        var localLogger = logger.child({ns: namespace, name: iterator.name});
        
         localLogger.info("Checking " + u)
         let resourceResponse = await fetch(url + u);
@@ -202,7 +226,12 @@ async function readResourcesFromSource(resourcesToRecreate: any[], namespace: st
                 res.items[i].metadata["ownerReferences"].length > 0) {
                     localLogger.info("Object " + res.items[i].metadata["name"] + "is owned, skipping creation")
             } else {
-                resources.push({ prefix: u, apiPath: iterator.path, o: res.items[i] });
+                resources.push({ 
+                    prefix: u, 
+                    apiPath: iterator.path, 
+                    o: res.items[i],
+                    ns: namespace,
+                    rsName:iterator.name} as ResourceToMove);
             }
         }
 
@@ -210,7 +239,7 @@ async function readResourcesFromSource(resourcesToRecreate: any[], namespace: st
     return resources;
 }
 
-function dumpFile(iterator: { prefix: string; apiPath: any; o: any; }) {
+function dumpFile(iterator: ResourceToMove) {
 
     let fileName = iterator.prefix.replace(/\//g, '__') + "_" + iterator.o.metadata.uid + ".json";
     fs.writeFileSync("out/" + fileName, JSON.stringify(iterator.o));
@@ -227,14 +256,15 @@ function sortAccordingToPriority(resources: any[]) {
 }
 
 
-function cleanup(resource: any) {
+function cleanup(obj: ResourceToMove) {
+    const resource = obj.o;
     delete resource.metadata.resourceVersion;
     delete resource.metadata.uid;
     delete resource.metadata.creationTimestamp;
     
     try {
-        switch(resource.kind){
-            case "Service": 
+        switch(obj.apiPath+'|'+obj.rsName){
+            case "/api/v1|services": 
             delete resource.spec.clusterIP; // ADD SWITCH to allow cluster IP settings
             break;
         } 
@@ -244,3 +274,14 @@ function cleanup(resource: any) {
 
 }
 
+interface ResourceToMove{
+    prefix: string;
+    apiPath: any; 
+    o: any;
+    ns: string;
+    rsName:string;
+}
+
+const sleep = (milliseconds:number) => {
+    return new Promise(resolve => setTimeout(resolve, milliseconds))
+  }
